@@ -37,17 +37,26 @@ async def upload_resume(file: UploadFile = File(...), user: User = Depends(get_c
                  original_filename=Path(file.filename or "resume").name[:255],
                  storage_key=storage_key, mime_type=file.content_type,
                  size_bytes=len(content), extracted_text=text)
-    db.add(row)
-    for item in propose_facts(text):
-        exists = db.scalar(select(CandidateFact).where(
-            CandidateFact.tenant_id == user.tenant_id,
-            CandidateFact.fact_key == item["fact_key"],
-            CandidateFact.fact_value == item["fact_value"]))
-        if not exists:
-            db.add(CandidateFact(tenant_id=user.tenant_id, resume_id=resume_id,
-                                 fact_key=item["fact_key"], fact_value=item["fact_value"],
-                                 confidence=item["confidence"], status="proposed"))
-    db.commit()
+    try:
+        db.add(row)
+        # Persist the parent row before inserting CandidateFact rows that reference it.
+        # Without flush(), SQLAlchemy may attempt the child INSERTs first.
+        db.flush()
+
+        for item in propose_facts(text):
+            exists = db.scalar(select(CandidateFact).where(
+                CandidateFact.tenant_id == user.tenant_id,
+                CandidateFact.fact_key == item["fact_key"],
+                CandidateFact.fact_value == item["fact_value"]))
+            if not exists:
+                db.add(CandidateFact(tenant_id=user.tenant_id, resume_id=resume_id,
+                                     fact_key=item["fact_key"], fact_value=item["fact_value"],
+                                     confidence=item["confidence"], status="proposed"))
+        db.commit()
+    except Exception:
+        db.rollback()
+        path.unlink(missing_ok=True)
+        raise HTTPException(500, "Resume was parsed but could not be saved. Please retry.")
     return {"resume_id": resume_id, "filename": row.original_filename,
             "parse_status": row.parse_status, "extracted_characters": len(text),
             "message": "Resume parsed. Extracted facts are proposals until you confirm them."}
